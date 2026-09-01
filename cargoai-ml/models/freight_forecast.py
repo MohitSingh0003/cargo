@@ -1,126 +1,148 @@
-import os
-import joblib
-import pandas as pd
+"""
+models/freight_forecast.py
+
+Serves freight-rate forecasts from the trained GradientBoostingRegressor
+in models/trained/freight_forecast_model.joblib (see
+training/train_freight_forecast.py).
+
+Public entry point keeps the same shape as the original placeholder so
+cargoai-backend/src/services/mlClient.js and app.py do not need to change:
+
+    forecast(route: str, cargo_type: str, horizon_days: int = 30) -> dict
+
+If the trained artifact is missing (e.g. a fresh clone before anyone has
+run the training scripts), this falls back to the original moving-average
++ linear-trend estimate so the service still boots and responds.
+"""
+
+import json
+from datetime import datetime, timedelta
+from pathlib import Path
+from functools import lru_cache
+
 import numpy as np
-from datetime import timedelta
+import pandas as pd
+
+ROOT = Path(__file__).resolve().parent.parent
+MODEL_PATH = ROOT / "models" / "trained" / "freight_forecast_model.joblib"
+CONTEXT_PATH = ROOT / "models" / "trained" / "freight_forecast_context.json"
+HISTORICAL_CSV = ROOT / "data" / "historical_rates.csv"
 
 
-BASE_DIR = os.path.dirname(os.path.dirname(__file__))
-DATA_PATH = os.path.join(BASE_DIR, "data", "historical_rates.csv")
-MODEL_PATH = os.path.join(BASE_DIR, "artifacts", "freight_model.joblib")
-
-LAGS = [1, 2, 3, 4]
-
-
-def create_features(df):
-    df = df.copy()
-
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values(["route", "date"])
-
-    for lag in LAGS:
-        df[f"lag_{lag}"] = df.groupby("route")["rate_usd_per_mt"].shift(lag)
-
-    df["rolling_mean_4"] = (
-        df.groupby("route")["rate_usd_per_mt"]
-        .transform(lambda x: x.shift(1).rolling(4).mean())
-    )
-
-    df["rolling_std_4"] = (
-        df.groupby("route")["rate_usd_per_mt"]
-        .transform(lambda x: x.shift(1).rolling(4).std())
-    )
-
-    df["week"] = df["date"].dt.isocalendar().week.astype(int)
-    df["month"] = df["date"].dt.month
-
-    return df
+@lru_cache(maxsize=1)
+def _load_model():
+    try:
+        import joblib
+        return joblib.load(MODEL_PATH)
+    except FileNotFoundError:
+        return None
 
 
-def load_model():
-    if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(
-            "Freight model not found. Run training/train_forecast.py first."
-        )
-
-    return joblib.load(MODEL_PATH)
-
-
-def load_data():
-    return pd.read_csv(DATA_PATH, parse_dates=["date"])
-
-
-def predict_forecast(route: str, periods: int = 4):
-    df = load_data()
-
-    route_df = (
-        df[df["route"] == route]
-        .sort_values("date")
-        .copy()
-    )
-
-    if route_df.empty:
+@lru_cache(maxsize=1)
+def _load_context():
+    try:
         return {
-            "route": route,
-            "forecast": [],
-            "trend": "UNKNOWN",
-            "message": "No historical data available for this route."
+            (row["route"], row["cargo_type"]): row
+            for row in json.loads(CONTEXT_PATH.read_text())
         }
+    except FileNotFoundError:
+        return {}
 
-    model = load_model()
 
-    rates = route_df["rate_usd_per_mt"].tolist()
-    dates = route_df["date"].tolist()
+def _fallback_moving_average(route: str, cargo_type: str, horizon_days: int) -> dict:
+    """Original placeholder behaviour, kept as a safety net."""
+    df = pd.read_csv(HISTORICAL_CSV)
+    subset = df[(df["route"] == route) & (df["cargo_type"] == cargo_type)].sort_values("date")
+    if subset.empty:
+        subset = df[df["cargo_type"] == cargo_type].sort_values("date")
+    rates = subset["freight_rate_usd_per_ton"].tail(30).to_numpy()
+    if len(rates) == 0:
+        rates = df["freight_rate_usd_per_ton"].to_numpy()
 
+    moving_avg = float(np.mean(rates[-14:])) if len(rates) >= 14 else float(np.mean(rates))
+    trend = float(np.polyfit(range(len(rates)), rates, 1)[0]) if len(rates) > 1 else 0.0
+
+    last_date = pd.to_datetime(subset["date"]).max() if not subset.empty else pd.Timestamp.today()
     predictions = []
-
-    last_date = dates[-1]
-
-    for i in range(periods):
-        if len(rates) < 4:
-            break
-
-        recent = rates[-4:]
-
-        prediction_features = pd.DataFrame([{
-            "lag_1": recent[-1],
-            "lag_2": recent[-2],
-            "lag_3": recent[-3],
-            "lag_4": recent[-4],
-            "rolling_mean_4": np.mean(recent),
-            "rolling_std_4": np.std(recent),
-            "week": (last_date + timedelta(weeks=i + 1)).isocalendar().week,
-            "month": (last_date + timedelta(weeks=i + 1)).month
-        }])
-
-        prediction = float(model.predict(prediction_features)[0])
-
-        prediction = max(prediction, 0)
-
-        future_date = last_date + timedelta(weeks=i + 1)
-
+    for step in range(1, horizon_days + 1):
         predictions.append({
-            "date": future_date.strftime("%Y-%m-%d"),
-            "predictedRate": round(prediction, 2)
+            "date": (last_date + timedelta(days=step)).date().isoformat(),
+            "predicted_rate_usd_per_ton": round(moving_avg + trend * step, 2),
+        })
+    return {
+        "route": route,
+        "cargo_type": cargo_type,
+        "model": "moving_average_fallback",
+        "predictions": predictions,
+    }
+
+
+def is_trained_model_loaded() -> bool:
+    """True if the trained GBM artifact loaded successfully (vs. fallback)."""
+    return _load_model() is not None
+
+
+def forecast(route: str, cargo_type: str, horizon_days: int = 30) -> dict:
+    """
+    Forecast freight rate (USD/ton) for `route` + `cargo_type` over the
+    next `horizon_days` days.
+
+    Returns:
+        {
+          "route": str,
+          "cargo_type": str,
+          "model": "gradient_boosting_regressor",
+          "predictions": [{"date": "YYYY-MM-DD", "predicted_rate_usd_per_ton": float}, ...]
+        }
+    """
+    model = _load_model()
+    if model is None:
+        return _fallback_moving_average(route, cargo_type, horizon_days)
+
+    context = _load_context()
+    ctx = context.get((route, cargo_type))
+    if ctx is None:
+        # unseen route/cargo combo -> fall back to averages across cargo type
+        return _fallback_moving_average(route, cargo_type, horizon_days)
+
+    last_date = pd.to_datetime(ctx["date"])
+    fuel_price = ctx["fuel_price_index"]
+    rate_lag_7 = ctx["rate_lag_7"]
+    rate_lag_30 = ctx["freight_rate_usd_per_ton"]  # most recent actual, used as the 30-day lag proxy
+
+    rows = []
+    running_rate = ctx["freight_rate_usd_per_ton"]
+    for step in range(1, horizon_days + 1):
+        d = last_date + timedelta(days=step)
+        doy = d.dayofyear
+        rows.append({
+            "route": route,
+            "cargo_type": cargo_type,
+            "fuel_price_index": fuel_price,
+            "day_of_year_sin": np.sin(2 * np.pi * doy / 365.25),
+            "day_of_year_cos": np.cos(2 * np.pi * doy / 365.25),
+            "days_since_start": ctx.get("days_since_start", 0) + step,
+            "rate_lag_7": rate_lag_7 if step <= 7 else running_rate,
+            "rate_lag_30": rate_lag_30,
         })
 
-        rates.append(prediction)
+    features = pd.DataFrame(rows)
+    preds = model.predict(features)
 
-    if len(predictions) >= 2:
-        first = predictions[0]["predictedRate"]
-        last = predictions[-1]["predictedRate"]
-
-        if last > first * 1.02:
-            trend = "UP"
-        elif last < first * 0.98:
-            trend = "DOWN"
-        else:
-            trend = "STABLE"
-    else:
-        trend = "UNKNOWN"
+    predictions = []
+    for step, p in enumerate(preds, start=1):
+        d = (last_date + timedelta(days=step)).date().isoformat()
+        predictions.append({"date": d, "predicted_rate_usd_per_ton": round(float(p), 2)})
+    running_rate = float(preds[-1])
 
     return {
         "route": route,
-        "forecast": predictions,
-        "trend": trend
+        "cargo_type": cargo_type,
+        "model": "gradient_boosting_regressor",
+        "predictions": predictions,
     }
+
+
+if __name__ == "__main__":
+    import pprint
+    pprint.pprint(forecast("Singapore-Rotterdam", "container", horizon_days=7))
