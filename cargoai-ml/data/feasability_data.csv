@@ -1,0 +1,21 @@
+cargo_type,quantity_mt,vessel_type,vessel_capacity_mt,port_capacity_mt,draft_m,port_draft_limit_m,congestion,feasible
+Iron Ore,50000,Capesize,180000,200000,15,18,0.20,1
+Coal,70000,Panamax,80000,100000,12,14,0.30,1
+Grain,40000,Panamax,80000,90000,11,13,0.20,1
+Iron Ore,190000,Capesize,180000,200000,17,18,0.20,0
+Coal,95000,Panamax,80000,100000,13,14,0.40,0
+Grain,30000,Handysize,25000,50000,9,12,0.20,0
+Iron Ore,100000,Capesize,180000,200000,16,18,0.30,1
+Coal,60000,Panamax,80000,100000,12,14,0.50,1
+Grain,20000,Handysize,25000,50000,10,12,0.10,1
+Iron Ore,175000,Capesize,180000,200000,17,18,0.70,0
+Coal,75000,Panamax,80000,100000,13,14,0.80,0
+Grain,22000,Handysize,25000,50000,10,12,0.20,1
+Iron Ore,90000,Capesize,180000,200000,15,18,0.10,1
+Coal,70000,Panamax,80000,100000,12,14,0.20,1
+Grain,28000,Handysize,25000,50000,10,12,0.60,0
+Iron Ore,120000,Capesize,180000,200000,16,18,0.40,1
+Coal,82000,Panamax,80000,100000,13,14,0.20,0
+Grain,18000,Handysize,25000,50000,9,12,0.10,1
+Iron Ore,185000,Capesize,180000,200000,16,18,0.30,0
+Coal,50000,Panamax,80000,100000,12,14,0.30,1
