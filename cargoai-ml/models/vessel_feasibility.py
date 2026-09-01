@@ -1,62 +1,147 @@
-# models/vessel_feasibility.py
-#
-# MVP feasibility model: rule-based checks on vessel size vs. port limits,
-# plus a simple congestion-risk heuristic. This stands in for the real
-# XGBoost/LightGBM feasibility + risk models until enough labeled voyage
-# outcome data exists to train them.
-#
-# Upgrade path: replace the body of assess_feasibility() with a trained
-# model's .predict() call — the function signature and return shape stay
-# the same so the Express side never needs to change.
-
-# Rough max vessel-size limits per port (illustrative placeholder data).
-PORT_LIMITS = {
-    "Paradip": {"maxDWT": 180000},
-    "Vizag": {"maxDWT": 150000},
-    "Gangavaram": {"maxDWT": 200000},
-    "Gopalpur": {"maxDWT": 100000},
-    "Dhamra": {"maxDWT": 200000},
-    "Sagar-Sandheads": {"maxDWT": 100000},
-    "Haldia": {"maxDWT": 50000},
-}
-
-# Approximate deadweight tonnage by vessel type (illustrative placeholder data).
-VESSEL_DWT = {
-    "Handysize": 35000,
-    "Supramax": 58000,
-    "Panamax": 80000,
-    "Capesize": 180000,
-}
-
-# Baseline congestion risk by port (illustrative placeholder data).
-PORT_CONGESTION = {
-    "Paradip": "MEDIUM",
-    "Vizag": "LOW",
-    "Gangavaram": "LOW",
-    "Gopalpur": "MEDIUM",
-    "Dhamra": "MEDIUM",
-    "Sagar-Sandheads": "HIGH",
-    "Haldia": "HIGH",
-}
+import os
+import joblib
+import pandas as pd
 
 
-def assess_feasibility(cargo_type: str, quantity_mt: float, vessel_type: str, destination: str) -> dict:
-    vessel_dwt = VESSEL_DWT.get(vessel_type, 80000)
-    port_limit = PORT_LIMITS.get(destination, {}).get("maxDWT", 150000)
+BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 
-    fits_port = vessel_dwt <= port_limit
-    fits_cargo = quantity_mt <= vessel_dwt
+MODEL_PATH = os.path.join(
+    BASE_DIR,
+    "artifacts",
+    "feasibility_model.joblib"
+)
 
-    passed = fits_port and fits_cargo
-    risk = PORT_CONGESTION.get(destination, "MEDIUM")
+
+def load_model():
+
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(
+            "Feasibility model not found. "
+            "Run training/train_feasibility.py first."
+        )
+
+    return joblib.load(MODEL_PATH)
+
+
+def assess_feasibility(
+    cargo_type: str,
+    quantity_mt: float,
+    vessel_type: str,
+    origin: str,
+    destination: str
+):
+
+    model_data = load_model()
+
+    model = model_data["model"]
+    encoder = model_data["encoder"]
+
+    # Demo/default operational values.
+    vessel_capacity = {
+        "Handysize": 25000,
+        "Panamax": 80000,
+        "Capesize": 180000
+    }.get(vessel_type, 80000)
+
+    port_capacity = 200000
+
+    port_draft_limit = 18
+
+    vessel_draft = {
+        "Handysize": 10,
+        "Panamax": 13,
+        "Capesize": 17
+    }.get(vessel_type, 13)
+
+    congestion = 0.30
+
+    input_df = pd.DataFrame([{
+        "cargo_type": cargo_type,
+        "quantity_mt": quantity_mt,
+        "vessel_type": vessel_type,
+        "vessel_capacity_mt": vessel_capacity,
+        "port_capacity_mt": port_capacity,
+        "draft_m": vessel_draft,
+        "port_draft_limit_m": port_draft_limit,
+        "congestion": congestion
+    }])
+
+    categorical_columns = [
+        "cargo_type",
+        "vessel_type"
+    ]
+
+    encoded = encoder.transform(
+        input_df[categorical_columns]
+    )
+
+    encoded_df = pd.DataFrame(
+        encoded,
+        columns=encoder.get_feature_names_out(
+            categorical_columns
+        )
+    )
+
+    numerical_columns = [
+        "quantity_mt",
+        "vessel_capacity_mt",
+        "port_capacity_mt",
+        "draft_m",
+        "port_draft_limit_m",
+        "congestion"
+    ]
+
+    X = pd.concat(
+        [
+            input_df[numerical_columns].reset_index(drop=True),
+            encoded_df.reset_index(drop=True)
+        ],
+        axis=1
+    )
+
+    prediction = int(
+        model.predict(X)[0]
+    )
+
+    probability = float(
+        model.predict_proba(X)[0][1]
+    )
+
+    reasons = []
+
+    if quantity_mt > vessel_capacity:
+        reasons.append(
+            "Cargo quantity exceeds vessel capacity."
+        )
+
+    if quantity_mt > port_capacity:
+        reasons.append(
+            "Cargo quantity exceeds port capacity."
+        )
+
+    if vessel_draft > port_draft_limit:
+        reasons.append(
+            "Vessel draft exceeds port draft limit."
+        )
+
+    if not reasons:
+        reasons.append(
+            "Cargo and vessel parameters are within expected limits."
+        )
 
     return {
-        "pass": passed,
-        "risk": risk,
-        "details": {
-            "vesselDWT": vessel_dwt,
-            "portMaxDWT": port_limit,
-            "fitsPort": fits_port,
-            "fitsCargoQuantity": fits_cargo,
-        },
+        "cargoType": cargo_type,
+        "vesselType": vessel_type,
+        "origin": origin,
+        "destination": destination,
+        "feasible": bool(prediction),
+        "probability": round(probability, 3),
+        "risk": (
+            "LOW"
+            if probability >= 0.75
+            else "MEDIUM"
+            if probability >= 0.50
+            else "HIGH"
+        ),
+        "reasons": reasons
     }
